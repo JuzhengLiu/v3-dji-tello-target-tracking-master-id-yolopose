@@ -19,6 +19,7 @@ Usage:
     python demo_webcam.py --model yolov8s --confidence 0.6
     python demo_webcam.py --webcam 1
     python demo_webcam.py --video path/to/video.mp4
+    python demo_webcam.py --tracking-method yolo
 """
 
 import argparse
@@ -60,6 +61,8 @@ class WebcamDemo:
             print(f"Loaded {config.model_name} on {config.device}")
         except Exception as e:
             print(f"Failed to load YOLO: {e}")
+            import traceback
+            traceback.print_exc() # 打印详细错误方便调试
             print("Falling back to HSV detector")
             self.detector = HSVDetector(config, "green")
             self.use_yolo = False
@@ -144,6 +147,10 @@ class WebcamDemo:
         # Detect objects
         if self.tracking_enabled:
             if self.use_yolo:
+                # [注意] 如果使用 yolo 跟踪模式，detect 方法内部已经处理了 ID
+                # 但 SingleObjectTracker 主要是为了从多目标中选一个离中心最近的
+                # 所以这里的逻辑依然适用：detect_closest_to_center 会返回一个 Detection 对象
+                # 如果是 yolo 模式，这个 Detection 对象会包含 track_id
                 detection = self.detector.detect_closest_to_center(frame)
             else:
                 detection = self.detector.detect(frame)
@@ -204,7 +211,9 @@ class WebcamDemo:
             info["FPS"] = f"{self.fps_counter.get_fps():.1f}"
 
         info["Tracking"] = "ON" if self.tracking_enabled else "OFF"
+        # [修改] 显示当前的检测器和跟踪模式
         info["Detector"] = "YOLO" if self.use_yolo else "HSV"
+        info["Mode"] = self.config.tracking_method.upper()
 
         if self.tracker.has_target():
             target = self.tracker.target
@@ -290,6 +299,7 @@ Examples:
   python demo_webcam.py --webcam 1
   python demo_webcam.py --video test_video.mp4
   python demo_webcam.py --classes person ball
+  python demo_webcam.py --tracking-method yolo
         """,
     )
 
@@ -304,9 +314,10 @@ Examples:
     parser.add_argument(
         "--model",
         type=str,
-        default="yolov8n",
-        choices=["yolov8n", "yolov8s", "yolov8m", "yolov8l", "yolov8x"],
-        help="YOLO model to use (default: yolov8n)",
+        # [修改] 默认值改为 yolov8s-worldv2
+        default="yolov8s-worldv2",
+        choices=["yolov8n", "yolov8s", "yolov8m", "yolov8l", "yolov8x", "yolov8s-worldv2"],
+        help="YOLO model to use (default: yolov8s-worldv2)",
     )
 
     parser.add_argument(
@@ -321,6 +332,15 @@ Examples:
         nargs="+",
         default=None,
         help="Target classes to detect (e.g., person ball)",
+    )
+    
+    # [新增] 跟踪模式选择参数
+    parser.add_argument(
+        "--tracking-method",
+        type=str,
+        default="custom",
+        choices=["custom", "yolo"],
+        help="Tracking method: 'custom' (simple distance) or 'yolo' (ByteTrack/BoT-SORT)",
     )
 
     parser.add_argument(
@@ -348,10 +368,15 @@ def main():
 
     # Create configuration
     config = get_webcam_config()
+    # 这里的赋值会覆盖 get_webcam_config 中的 model_name
+    # 现在 args.model 默认为 yolov8s-worldv2，所以不会出错
     config.model_name = args.model
     config.confidence_threshold = args.confidence
     config.frame_width = args.width
     config.frame_height = args.height
+    
+    # [新增] 应用跟踪模式配置
+    config.tracking_method = args.tracking_method
 
     if args.classes:
         config.target_classes = args.classes

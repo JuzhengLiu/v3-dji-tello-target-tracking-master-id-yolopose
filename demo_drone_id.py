@@ -1,41 +1,12 @@
 #!/usr/bin/env python3
 """
-Drone Demo - Autonomous object tracking with DJI Tello.
+Drone Demo - Autonomous object tracking with DJI Tello (ID Locking Version).
 
-This demo provides full autonomous tracking capabilities with the Tello drone.
-The drone will automatically follow detected objects using PID control.
-
-SAFETY WARNINGS:
-- Always fly in an open area away from people and obstacles
-- Keep manual control ready (spacebar to disable tracking)
-- Monitor battery level
-- Be prepared to emergency land (ESC key)
-
-Controls:
-    TAB       - Takeoff
-    BACKSPACE - Land
-    ESC       - Emergency stop
-    SPACE     - Toggle tracking mode
-    q         - Quit (will land first)
-
-    Manual control (when tracking disabled):
-    w/s       - Forward/Backward
-    a/d       - Left/Right
-    UP/DOWN   - Ascend/Descend
-    LEFT/RIGHT- Rotate Left/Right
-
-    Display:
-    h         - Toggle HUD
-    f         - Toggle FPS
-    t         - Toggle telemetry
-    r         - Record video
-    c         - Take photo
-
-Usage:
-    python demo_drone.py
-    python demo_drone.py --model yolov8s --confidence 0.6
-    python demo_drone.py --classes person
-    python demo_drone.py --mock  # Test without drone hardware
+此版本已修改为：
+1. 使用 ObjectTracker 进行多目标 ID 记忆。
+2. 自动锁定画面中心的目标 ID。
+3. 即使目标移动到边缘，只要 ID 未丢失，就持续跟随该 ID，忽略其他目标。
+4. 按 'r' 键可以重置锁定，重新寻找中心目标。
 """
 
 import argparse
@@ -45,6 +16,7 @@ from datetime import datetime
 from pathlib import Path
 
 import cv2
+import numpy as np
 
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent))
@@ -52,7 +24,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from src.config import Config, DroneConfig, get_drone_config
 from src.detector import ObjectDetector
 from src.drone_controller import DroneController, DroneState, MockDroneController
-from src.tracker import SingleObjectTracker
+from src.tracker import ObjectTracker
 from src.utils import (
     FPSCounter,
     draw_bbox,
@@ -77,7 +49,10 @@ class DroneDemo:
         self.detector = ObjectDetector(config)
         print(f"Loaded {config.model_name} on {config.device}")
 
-        self.tracker = SingleObjectTracker(config)
+        # Initialize Tracker
+        self.tracker = ObjectTracker(config)
+        self.locked_target_id = None  # 记录当前锁定的目标 ID
+
         self.fps_counter = FPSCounter()
 
         # Initialize drone controller
@@ -122,7 +97,8 @@ class DroneDemo:
         print("  h - Toggle HUD")
         print("  f - Toggle FPS")
         print("  t - Toggle telemetry")
-        print("  r - Record video")
+        print("  r - Reset Lock (Find new target)")
+        print("  v - Record video")
         print("  c - Take photo")
         print("  q - Quit (will land first)")
         print("=" * 60)
@@ -174,49 +150,99 @@ class DroneDemo:
         self.cleanup()
 
     def process_frame(self, frame):
-        """Process a single frame."""
+        """Process a single frame with ID locking logic."""
         display_frame = frame.copy()
 
         # Detect and track
-        if self.drone.is_flying():
-            detection = self.detector.detect_closest_to_center(frame)
-            target = self.tracker.update(detection)
+        # 注意：如果 drone 未起飞或未进入状态，也可以进行检测以便预览
+        if self.drone.is_flying() or self.use_mock or True:
+            # 1. 检测 (Detect)
+            # 如果是 'yolo' 模式，detector 内部会处理 ID 分配
+            detections = self.detector.detect(frame)
+            
+            # 2. 更新追踪器 (Tracker Update)
+            # 如果是 'yolo' 模式，tracker 会直接沿用 detector 给的 ID
+            # 如果是 'custom' 模式，tracker 会使用距离算法计算 ID
+            tracked_objects = self.tracker.update(detections)
+            
+            target = None
+            
+            # 3. ID 锁定逻辑 (ID Locking)
+            if self.locked_target_id is not None:
+                # 检查之前锁定的 ID 是否依然存在于当前的追踪列表中
+                if self.locked_target_id in tracked_objects:
+                    target = tracked_objects[self.locked_target_id]
+                else:
+                    # 目标丢失 (Tracker 认为该 ID 消失了)
+                    # 此时不立即重置 locked_target_id，等待它可能重现 (由 Tracker 决定何时彻底删除)
+                    # 但在当前帧，我们没有目标
+                    pass
+                    # 如果需要自动切换目标，可以在这里设置 self.locked_target_id = None
+            
+            # 4. 如果没有锁定目标 (或目标已彻底跟丢)，寻找新的目标
+            # 策略：选择离画面中心最近的物体
+            if self.locked_target_id is None or (target is None and self.locked_target_id not in tracked_objects):
+                 if len(tracked_objects) > 0:
+                    h, w = frame.shape[:2]
+                    center = (w // 2, h // 2)
+                    
+                    # 找离中心最近的
+                    best_obj = min(tracked_objects.values(), 
+                                   key=lambda o: (o.center[0]-center[0])**2 + (o.center[1]-center[1])**2)
+                    
+                    self.locked_target_id = best_obj.id
+                    target = best_obj
+                    print(f"Locked on new target ID: {target.id}")
 
-            # Autonomous tracking
-            if self.drone.tracking_enabled:
+            # 5. 自主跟随 (只跟随 target)
+            # 只有当 target 存在且当前处于 tracking_enabled 模式时才发送指令
+            if self.drone.tracking_enabled and target is not None:
                 self.drone.track_target(target)
+            elif self.drone.tracking_enabled and target is None:
+                # 开启了跟随但找不到目标：悬停
+                self.drone.hover()
 
-            # Visualize
-            if target and target.disappeared == 0:
-                color = (0, 255, 0) if self.drone.tracking_enabled else (255, 165, 0)
-                label = f"{target.class_name} (ID: {target.id})"
-
+            # 6. 可视化
+            for obj in tracked_objects.values():
+                is_locked = (obj.id == self.locked_target_id)
+                
+                # 颜色区分：锁定目标为绿色，其他为橙色(未激活)或红色
+                if is_locked:
+                    color = (0, 255, 0) if self.drone.tracking_enabled else (0, 139, 139) # 绿/黄
+                    thickness = 3
+                else:
+                    color = (0, 0, 255) # 红
+                    thickness = 1
+                    
+                # 绘制边框
+                label = f"{obj.class_name} ID:{obj.id}"
                 display_frame = draw_bbox(
                     display_frame,
-                    target.bbox,
+                    obj.bbox,
                     label,
-                    target.confidence,
+                    obj.confidence,
                     color,
-                    thickness=2,
+                    thickness=thickness,
                 )
 
-                # Draw trajectory
-                if len(target.centers) > 1:
-                    display_frame = draw_trajectory(
-                        display_frame, list(target.centers), (0, 255, 255), thickness=2
-                    )
+                # 仅为锁定目标绘制轨迹和向量
+                if is_locked:
+                    if len(obj.centers) > 1:
+                        display_frame = draw_trajectory(
+                            display_frame, list(obj.centers), color, thickness=2
+                        )
 
-                # Draw tracking vector (to frame center)
-                if self.drone.tracking_enabled:
-                    h, w = frame.shape[:2]
-                    frame_center = (w // 2, h // 2)
-                    display_frame = draw_vector(
-                        display_frame,
-                        target.center,
-                        frame_center,
-                        (255, 0, 255),
-                        thickness=2,
-                    )
+                    # Draw tracking vector
+                    if self.drone.tracking_enabled:
+                        h, w = frame.shape[:2]
+                        frame_center = (w // 2, h // 2)
+                        display_frame = draw_vector(
+                            display_frame,
+                            obj.center,
+                            frame_center,
+                            (255, 0, 255),
+                            thickness=2,
+                        )
 
         # Draw frame center crosshair
         display_frame = draw_crosshair(display_frame, color=(0, 0, 255), size=30)
@@ -246,21 +272,26 @@ class DroneDemo:
         if self.drone.is_flying():
             tracking_status = "ACTIVE" if self.drone.tracking_enabled else "MANUAL"
             info["Mode"] = tracking_status
+        
+        # [新增] 显示追踪算法模式
+        info["Algo"] = self.config.tracking_method.upper()
 
         # Target info
-        if self.tracker.has_target():
-            target = self.tracker.target
-            info["Target"] = f"ID:{target.id}"
-            info["Confidence"] = f"{target.confidence:.2f}"
+        if self.locked_target_id is not None and self.tracker.objects:
+             obj = self.tracker.get_object(self.locked_target_id)
+             if obj:
+                info["Target"] = f"ID:{obj.id}"
+                info["Conf"] = f"{obj.confidence:.2f}"
+             else:
+                info["Target"] = "Lost"
         else:
-            info["Target"] = "None"
+            info["Target"] = "Scanning"
 
         # Telemetry
         if self.show_telemetry and not self.use_mock:
             telemetry = self.drone.get_telemetry()
-            info["Battery"] = f"{telemetry.get('battery', 0)}%"
-            info["Height"] = f"{telemetry.get('height', 0)}cm"
-            info["Temp"] = f"{telemetry.get('temperature', 0)}°C"
+            info["Bat"] = f"{telemetry.get('battery', 0)}%"
+            info["H"] = f"{telemetry.get('height', 0)}cm"
 
         # Recording indicator
         if self.recording:
@@ -344,6 +375,11 @@ class DroneDemo:
             print(f"Telemetry {'shown' if self.show_telemetry else 'hidden'}")
 
         elif key == ord("r"):
+            print("Resetting tracker and lock...")
+            self.tracker.reset()
+            self.locked_target_id = None
+        
+        elif key == ord("v"):
             self.toggle_recording()
 
         elif key == ord("c"):
@@ -410,27 +446,16 @@ class DroneDemo:
 def parse_args():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
-        description="Drone demo for autonomous object tracking",
+        description="Drone demo for autonomous object tracking (ID Lock Mode)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-                Examples:
-                python demo_drone.py
-                python demo_drone.py --model yolov8s --confidence 0.6
-                python demo_drone.py --classes person
-                python demo_drone.py --mock  # Test without drone
-                Safety:
-                - Always fly in open areas away from people
-                - Monitor battery level
-                - Keep emergency stop ready (ESC key)
-                        """,
     )
 
     parser.add_argument(
         "--model",
         type=str,
-        default="yolov8s",
-        choices=["yolov8n", "yolov8s", "yolov8m", "yolov8l", "yolov8x"],
-        help="YOLO model to use (default: yolov8s)",
+        # [修改] 默认使用 YOLO-Worldv2
+        default="yolov8s-worldv2",
+        help="YOLO model to use (default: yolov8s-worldv2)",
     )
 
     parser.add_argument(
@@ -447,11 +472,19 @@ def parse_args():
         help="Target classes to detect (e.g., person ball)",
     )
 
+    # [新增] 跟踪模式选择参数
+    parser.add_argument(
+        "--tracking-method",
+        type=str,
+        default="custom",
+        choices=["custom", "yolo"],
+        help="Tracking method: 'custom' (simple distance) or 'yolo' (ByteTrack/BoT-SORT)",
+    )
+
     parser.add_argument(
         "--device",
         type=str,
         default=None,
-        choices=["cpu", "cuda"],
         help="Device to run model on (default: auto)",
     )
 
@@ -477,6 +510,9 @@ def main():
     config.model_name = args.model
     config.confidence_threshold = args.confidence
     config.drone_speed = args.speed
+    
+    # [新增] 应用跟踪模式
+    config.tracking_method = args.tracking_method
 
     if args.classes:
         config.target_classes = args.classes
